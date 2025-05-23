@@ -1,0 +1,94 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Virtual environments (pyenv or venv)
+.venv/
+venv/
+env/
+llm-env/
+.python-version
+
+# pyenv global/local stuff
+# (keep .python-version if you want to pin the Python version via pyenv)
+# You can omit this if you're using it intentionally:
+# .python-version
+
+# Pip environment files
+pip-log.txt
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# PyInstaller
+#  Usually contains temp files, build artifacts
+*.manifest
+*.spec
+
+# PyTorch Lightning / checkpoints
+*.ckpt
+*.pt
+*.pth
+
+# Jupyter
+.ipynb_checkpoints
+
+# PyCharm
+.idea/
+
+# VSCode
+.vscode/
+
+# macOS
+.DS_Store
+
+# Logs and local test stuff
+*.log
+*.tmp
+*.test
+.cache/
+coverage/
+htmlcov/
+
+# Test output
+.tox/
+.nox/
+.pytest_cache/
+.coverage
+coverage.xml
+nosetests.xml
+test-results/
+
+# MyPy / linting
+.mypy_cache/
+.pytype/
+.pylint.d/
+
+# Other tools
+.pyre/
+.pyright/
+
+# Datasets and large artifacts
+data/
+logs/
+checkpoints/
+models/
+

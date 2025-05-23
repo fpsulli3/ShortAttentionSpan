@@ -1,0 +1,20 @@
+[project]
+name = "LLM"
+version = "0.1.0"
+description = "Default template for PDM package"
+authors = [
+    "Frank Sullivan <fpsulli3@gmail.com>",
+    {name = "Frank Sullivan", email = "fpsulli3@gmail.com"},
+]
+requires-python = "==3.12.*"
+
+dependencies = [
+    "torch>=2.7",
+    "tiktoken>=0.9.0",
+    "numpy>=2.2.5",
+]
+readme = "README.md"
+license = {text = "MIT"}
+
+[tool.pdm]
+distribution = false
