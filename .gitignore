@@ -76,6 +76,7 @@ htmlcov/
 coverage.xml
 nosetests.xml
 test-results/
+outputs/
 
 # MyPy / linting
 .mypy_cache/
