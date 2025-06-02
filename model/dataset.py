@@ -5,6 +5,8 @@ import random
 from datasets import load_dataset
 from torch.utils.data import IterableDataset, Dataset, DataLoader
 from pathlib import Path
+import mmap
+import numpy as np
 
 class GPTDatasetV1(Dataset):
     def __init__(self, txt, tokenizer, max_length, stride):
@@ -124,6 +126,89 @@ class SequenceFileDataset(IterableDataset):
             if input_tokens[1:] != target_tokens[:-1]:
                 print(f"Invalid sequence pair detected:\ninput: {input_tokens}\nouput: {target_tokens}")
             yield torch.tensor(input_tokens), torch.tensor(target_tokens)
+
+class PreshuffledTokenFileDataset(IterableDataset):
+    def __init__(self, token_files, shuffle_files, context_length, chunk_length=2048, bytes_per_token=2, bytes_per_chunk_index=4):
+
+        if len(token_files) != len(shuffle_files):
+            raise ValueError(f"Token and Shuffle file counts must match. Given len(token_files)={len(token_files)}, len(shuffle_files)={len(shuffle_files)}")
+
+        if (len(token_files) == 0):
+            raise ValueError("Given 0 token files")
+
+        if chunk_length % context_length != 0:
+            raise ValueError(f"chunk_length must be an integer multiple of context_length. Given context_length={context_length}, chunk_length={chunk_length}")
+
+        self.token_files = token_files
+        self.shuffle_files = shuffle_files 
+
+        self.bytes_per_token = bytes_per_token
+
+        self.context_length = context_length
+        self.bytes_per_sequence = context_length * bytes_per_token
+        self.sequences_per_chunk = chunk_length // context_length
+
+        self.chunk_length = chunk_length
+        self.bytes_per_chunk = chunk_length * bytes_per_token
+        self.bytes_per_chunk_index = bytes_per_chunk_index
+
+        self.prepare()
+
+    def prepare(self):
+        self.token_file_handles = [open(f, "rb") for f in self.token_files]
+        self.token_mm = [mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) for f in self.token_file_handles]
+        self.shuffle_file_handles = [open(f, "rb") for f in self.shuffle_files]
+
+    def cleanup(self, idx):
+        del self.token_files[idx]
+        del self.shuffle_files[idx]
+
+        self.shuffle_file_handles[idx].close()
+        del self.shuffle_file_handles[idx]
+
+        self.token_mm[idx].close()
+        del self.token_mm[idx]
+
+        self.token_file_handles[idx].close()
+        del self.token_file_handles[idx]
+    
+    def __iter__(self):
+        while len(self.token_files) > 0:
+            num_files = len(self.token_files)
+            idx = random.randint(0, num_files-1)
+            shuffle_file_handle = self.shuffle_file_handles[idx]
+            token_mm = self.token_mm[idx]
+
+            chunk_id_bytes = shuffle_file_handle.read(self.bytes_per_chunk_index)
+            if not chunk_id_bytes or len(chunk_id_bytes) < self.bytes_per_chunk_index:
+                self.cleanup(idx)
+                continue
+
+            chunk_id = int.from_bytes(chunk_id_bytes, byteorder="little")
+
+            chunk_start = chunk_id * self.bytes_per_chunk
+            chunk_read_length = (self.chunk_length + 1) * self.bytes_per_token # extra token for targets
+            chunk_end = chunk_start + chunk_read_length
+            chunk_bytes = token_mm[chunk_start:chunk_end]
+            min_acceptable_chunk_size_bytes = (self.context_length + 1) * self.bytes_per_token # extra token for targets
+
+            if not chunk_bytes or len(chunk_bytes) < min_acceptable_chunk_size_bytes:
+                print(f"Warning: ran into EOF while reading chunk {chunk_id} from {self.token_files[idx]}")
+                continue
+
+            num_whole_sequences = len(chunk_bytes) // self.bytes_per_sequence
+            num_tokens = num_whole_sequences * self.context_length + 1 # extra token for targets
+            num_token_bytes = num_tokens * self.bytes_per_token
+            tokens_bytes = chunk_bytes[:num_token_bytes]
+            tokens = np.frombuffer(tokens_bytes, dtype=np.uint16).astype(np.int64)
+
+            for i in range(0, len(tokens) - self.context_length, self.context_length):
+                token_start = i
+                token_end = token_start + self.context_length
+                input_tokens = tokens[token_start:token_end]
+                target_tokens = tokens[token_start+1:token_end+1]
+                yield torch.tensor(input_tokens), torch.tensor(target_tokens)
+
 
 def select_random_articles(num_articles, article_pool):
     pool_size = len(article_pool)

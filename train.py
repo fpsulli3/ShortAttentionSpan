@@ -1,27 +1,18 @@
-from os import wait
 import torch
 import tiktoken
 from torch.utils.data import DataLoader
 from model.llm import GPTModel 
-from model.config import GPT_CONFIG_WIKI
+from model.config import GPT_CONFIG_GPT2_SMALL
 import argparse
-import math
-from torch.optim.lr_scheduler import LambdaLR
 import pandas as pd
 import os
 import model.dataset as ds
-import random
+import boto3
+from torch.cuda.amp import autocast, GradScaler
 
 # args
 
 parser = argparse.ArgumentParser(description="Train GPT model")
-
-parser.add_argument(
-        "--output",
-        type=str,
-        required=True,
-        help="Required path to save the trained model. Omit extension.",
-    )
 
 parser.add_argument(
         "--num_epochs",
@@ -35,21 +26,29 @@ args = parser.parse_args()
 
 # config
 
-config = GPT_CONFIG_WIKI
+config = GPT_CONFIG_GPT2_SMALL
 
 # file paths
 
-output_dir = f"outputs/{args.output}"
+data_dir = os.environ.get("DATA_DIR", "/mnt/data")
+output_dir = os.environ.get("OUT_DIR", "/mnt/output/")
+
 os.makedirs(output_dir, exist_ok=True)
 
-log_path = f"{output_dir}/loss.csv"
-autosave_path = f"{output_dir}/autosave.pt"
-training_sequence_file = f"{output_dir}/training_sequences.txt"
-validation_sequence_file = f"{output_dir}/validation_sequences.txt"
+log_path = os.path.join(output_dir, "loss.csv")
+autosave_path = os.path.join(output_dir, "autosave.pt")
+training_sequence_file = os.path.join(output_dir, "training_sequences.txt")
+validation_sequence_file = os.path.join(output_dir, "validation_sequences.txt")
 
 # logging
 
 starting_epoch = 0
+s3 = boto3.client("s3")
+BUCKET_NAME = "fpsulli3-llm-bucket"
+
+def upload_log(local_path):
+    s3_key = f"logs/{os.path.basename(local_path)}"
+    s3.upload_file(local_path, BUCKET_NAME, s3_key)
 
 def load_loss_log():
     global epoch_train_losses, epoch_val_losses, starting_epoch 
@@ -74,7 +73,12 @@ def log_loss(epoch, train_loss, val_loss):
         df = new_row 
 
     df.to_csv(log_path, index=False)
+    upload_log(log_path)
 
+def upload_checkpoint(local_path, s3_key=None):
+    if s3_key is None:
+        s3_key = f"checkpoints/{os.path.basename(local_path)}"
+    s3.upload_file(local_path, BUCKET_NAME, s3_key)
 
 # data loaders
 
@@ -82,57 +86,50 @@ tokenizer = tiktoken.get_encoding("gpt2")
 vocab_size = tokenizer.n_vocab
 config["vocab_size"] = vocab_size
 
-if not os.path.exists(training_sequence_file) or not os.path.exists(validation_sequence_file):
-    print("One or more sequence files is missing. Creating from scratch...")
 
-    print("Fetching articles...")
-    fetched_articles = ds.fetch_random_wiki_articles(16500, 0, 40000)
-    print(f"{len(fetched_articles)} fetched and selected")
+token_files = [
+            os.path.join(data_dir, f)
+            for f in os.listdir(data_dir)
+            if f.endswith(".tokens")
+        ]
 
-    training_articles = fetched_articles[:15000]
-    validation_articles = fetched_articles[15000:]
-    print(f"We have {len(training_articles)} training articles and {len(validation_articles)} validation articles")
 
-    print("Tokenizing...")
-    training_tokens = ds.concat_and_tokenize_articles(training_articles, tokenizer)
-    validation_tokens = ds.concat_and_tokenize_articles(validation_articles, tokenizer)
+shuffle_files = [
+            os.path.join(data_dir, f)
+            for f in os.listdir(data_dir)
+            if f.endswith(".shuffle")
+        ]
 
-    print("Chunking...")
-    training_input_sequences = ds.chunk_sequences(training_tokens, config["context_length"])
-    training_target_sequences = ds.chunk_sequences(training_tokens[1:], config["context_length"])
-    training_sequence_pairs = list(zip(training_input_sequences, training_target_sequences))
+token_files = sorted(token_files)
+shuffle_files = sorted(shuffle_files)
 
-    validation_input_sequences = ds.chunk_sequences(validation_tokens, config["context_length"])
-    validation_target_sequences = ds.chunk_sequences(validation_tokens[1:], config["context_length"])
-    validation_sequence_pairs = list(zip(validation_input_sequences, validation_target_sequences))
+print(f"Token files found: {token_files}")
+print(f"Shuffle files found: {shuffle_files}")
 
-    print("Shuffling sequences...")
-    random.shuffle(training_sequence_pairs)
-    random.shuffle(validation_sequence_pairs)
+if len(token_files) < 2:
+    raise ValueError(f"We need at least 2 token files for training and validation, len(token_files)={len(token_files)}")
 
-    print("Saving...")
-    with open(training_sequence_file, "w") as f:
-        for sequence_pair in training_sequence_pairs:
-            f.write(" ".join(map(str, sequence_pair[0])) + "\n")
-            f.write(" ".join(map(str, sequence_pair[1])) + "\n")
+if len(token_files) != len(shuffle_files):
+    raise ValueError(f"The number of shuffle and token files must match, len(token_files)={len(token_files)}, len(shuffle_files)={len(shuffle_files)}")
 
-    with open(validation_sequence_file, "w") as f:
-        for sequence_pair in validation_sequence_pairs:
-            f.write(" ".join(map(str, sequence_pair[0])) + "\n")
-            f.write(" ".join(map(str, sequence_pair[1])) + "\n")
+for i in range(0, len(token_files)):
+    token_file = token_files[i]
+    shuffle_file = shuffle_files[i]
+    token_file_basename = os.path.basename(token_file)
+    shuffle_file_basename = os.path.basename(shuffle_file)
+    token_file_name = os.path.splitext(token_file_basename)[0]
+    shuffle_file_name = os.path.splitext(shuffle_file_basename)[0]
+    if token_file_name != shuffle_file_name:
+        raise ValueError(f"Found unmatching token and shuffle file names. token file: {token_file_name}, shuffle file: {shuffle_file_name}")
 
-    print("Wiki articles fetched, tokenized, chunked, shuffled, and saved :)")
-    user_input = input("Press enter to continue or 'x' to exit...").strip().lower()
+training_token_files = token_files[:-1]
+validation_token_files = token_files[-1:]
 
-    if user_input == "x":
-        print("Exiting.")
-        exit()
+training_shuffle_files = shuffle_files[:-1]
+validation_shuffle_files = shuffle_files[-1:]
 
-training_dataset = ds.SequenceFileDataset()
-validation_dataset = ds.SequenceFileDataset()
-
-training_dataset.load(training_sequence_file)
-validation_dataset.load(validation_sequence_file)
+training_dataset = ds.PreshuffledTokenFileDataset(training_token_files, training_shuffle_files, config["context_length"])
+validation_dataset = ds.PreshuffledTokenFileDataset(validation_token_files, validation_shuffle_files, config["context_length"])
 
 training_data_loader = DataLoader(
         training_dataset,
@@ -164,18 +161,7 @@ model.to(device)
 
 loss_fn = torch.nn.CrossEntropyLoss()
 optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0.01)
-
-def lr_schedule(step):
-    warmup_steps = 500
-    total_steps = args.num_epochs
-
-    if step < warmup_steps:
-            return step / warmup_steps
-    progress = (step - warmup_steps) / (total_steps - warmup_steps)
-    return 0.5 * (1+math.cos(math.pi * progress))
-
-# scheduler = LambdaLR(optimizer, lr_lambda=lr_schedule)
-
+scaler = GradScaler()
 
 # restore previous session if possible
 
@@ -207,6 +193,7 @@ else:
 
 milestone_save_every = 100 # epochs
 print_every = 10 # batches
+autosave_every = 1000 # batches
 final_epoch = args.num_epochs
 
 def train_epoch(epoch):
@@ -219,16 +206,18 @@ def train_epoch(epoch):
         input_tokens = input_tokens.to(device)
         target_tokens = target_tokens.to(device)
 
-        logits = model(input_tokens)
-        
-        loss = loss_fn(
-                logits.view(-1, logits.size(-1)),
-                target_tokens.view(-1),
-            )
-
-        loss.backward()
-        optimizer.step()
         optimizer.zero_grad()
+
+        with autocast():
+            logits = model(input_tokens)
+            loss = loss_fn(
+                    logits.view(-1, logits.size(-1)),
+                    target_tokens.view(-1),
+                )
+
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
 
         training_losses.append(loss.item())
         running_loss += loss.item()
@@ -237,6 +226,10 @@ def train_epoch(epoch):
             avg_loss = running_loss / print_every
             print(f"Batch {batch_idx+1}: avg loss = {avg_loss:.4f}")
             running_loss = 0.0
+
+        if (batch_idx + 1) % autosave_every == 0:
+            torch.save(model.state_dict(), autosave_path)
+            upload_checkpoint(autosave_path)
 
     # scheduler.step()
     avg_training_loss = sum(training_losses) / len(training_losses)
@@ -276,9 +269,11 @@ for epoch in range(starting_epoch, final_epoch):
     torch.save(model.state_dict(), autosave_path)
 
     # save milestone
-    if (epoch + 1) % milestone_save_every == 0:
-        torch.save(model.state_dict(), f"outputs/{args.output}/milestone_{epoch + 1}.pt")
+    milestone_path = os.path.join(output_dir, f"milestone_{epoch+1}.pt")
+    torch.save(model.state_dict(), milestone_path)
+    upload_checkpoint(milestone_path)
 
 
-torch.save(model.state_dict(), f"outputs/{args.output}/final.pt")
+final_path = os.path.join(output_dir, "final.pt")
+torch.save(model.state_dict(), final_path)
 
