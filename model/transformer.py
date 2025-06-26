@@ -9,6 +9,7 @@ class TransformerBlock(nn.Module):
         self.att = attention.SelfAttention(
            embed_dim=cfg["emb_dim"],
            dropout_prob=cfg["drop_rate"],
+           n_heads=cfg["n_heads"],
         )
         self.ff = FeedForward(cfg)
         self.norm1 = LayerNorm(cfg["emb_dim"])

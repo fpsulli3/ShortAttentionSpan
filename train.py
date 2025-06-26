@@ -9,6 +9,7 @@ import os
 import model.dataset as ds
 import boto3
 from torch.cuda.amp import autocast, GradScaler
+import math
 
 # args
 
@@ -128,24 +129,7 @@ validation_token_files = token_files[-1:]
 training_shuffle_files = shuffle_files[:-1]
 validation_shuffle_files = shuffle_files[-1:]
 
-training_dataset = ds.PreshuffledTokenFileDataset(training_token_files, training_shuffle_files, config["context_length"])
-validation_dataset = ds.PreshuffledTokenFileDataset(validation_token_files, validation_shuffle_files, config["context_length"])
-
-training_data_loader = DataLoader(
-        training_dataset,
-        batch_size = config["batch_size"],
-        shuffle=False,
-        drop_last=True,
-        num_workers=0,
-    )
-
-validation_data_loader = DataLoader(
-        validation_dataset,
-        batch_size = config["batch_size"],
-        shuffle=False,
-        drop_last=True,
-        num_workers=0,
-    )
+# Dataset creation will be moved inside the epoch loop to reset for each epoch
 
 # device setup
 
@@ -160,8 +144,18 @@ model.train()
 model.to(device)
 
 loss_fn = torch.nn.CrossEntropyLoss()
-optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0.01)
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=0.01)
 scaler = GradScaler()
+
+# Learning rate scheduler with warmup and cosine annealing
+warmup_steps = 2000
+# Note: total_steps will be calculated after first dataset creation
+# Scheduler will be created after first dataset to get accurate total_steps
+scheduler = None
+total_steps = None
+
+# Gradient accumulation settings
+accumulation_steps = 8
 
 # restore previous session if possible
 
@@ -200,13 +194,14 @@ def train_epoch(epoch):
     print(f"\nTraining epoch {epoch+1}/{final_epoch}\n")
     running_loss = 0.0
     training_losses = []
+    accumulated_loss = 0.0
 
     model.train()
+    optimizer.zero_grad()
+    
     for batch_idx, (input_tokens, target_tokens) in enumerate(training_data_loader):
         input_tokens = input_tokens.to(device)
         target_tokens = target_tokens.to(device)
-
-        optimizer.zero_grad()
 
         with autocast():
             logits = model(input_tokens)
@@ -214,24 +209,38 @@ def train_epoch(epoch):
                     logits.view(-1, logits.size(-1)),
                     target_tokens.view(-1),
                 )
+            # Scale loss for gradient accumulation
+            loss = loss / accumulation_steps
 
         scaler.scale(loss).backward()
-        scaler.step(optimizer)
-        scaler.update()
-
-        training_losses.append(loss.item())
-        running_loss += loss.item()
+        accumulated_loss += loss.item()
+        
+        # Perform optimizer step every accumulation_steps
+        if (batch_idx + 1) % accumulation_steps == 0:
+            # Gradient clipping
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            
+            scaler.step(optimizer)
+            scaler.update()
+            scheduler.step()
+            optimizer.zero_grad()
+            
+            # Record loss (unscaled)
+            training_losses.append(accumulated_loss * accumulation_steps)
+            running_loss += accumulated_loss * accumulation_steps
+            accumulated_loss = 0.0
     
         if (batch_idx + 1) % print_every == 0:
-            avg_loss = running_loss / print_every
-            print(f"Batch {batch_idx+1}: avg loss = {avg_loss:.4f}")
+            avg_loss = running_loss / (print_every // accumulation_steps)
+            current_lr = scheduler.get_last_lr()[0]
+            print(f"Batch {batch_idx+1}: avg loss = {avg_loss:.4f}, lr = {current_lr:.6f}")
             running_loss = 0.0
 
         if (batch_idx + 1) % autosave_every == 0:
             torch.save(model.state_dict(), autosave_path)
             upload_checkpoint(autosave_path)
 
-    # scheduler.step()
     avg_training_loss = sum(training_losses) / len(training_losses)
     print(f"Training loss: {avg_training_loss:.4f}")
     return avg_training_loss
@@ -258,6 +267,40 @@ def validate_epoch(epoch):
         return avg_validation_loss
 
 for epoch in range(starting_epoch, final_epoch):
+    # Recreate datasets to reset file handles for each epoch
+    training_dataset = ds.PreshuffledTokenFileDataset(training_token_files, training_shuffle_files, config["context_length"])
+    validation_dataset = ds.PreshuffledTokenFileDataset(validation_token_files, validation_shuffle_files, config["context_length"])
+    
+    training_data_loader = DataLoader(
+            training_dataset,
+            batch_size = config["batch_size"],
+            shuffle=False,
+            drop_last=True,
+            num_workers=0,
+        )
+
+    validation_data_loader = DataLoader(
+            validation_dataset,
+            batch_size = config["batch_size"],
+            shuffle=False,
+            drop_last=True,
+            num_workers=0,
+        )
+    
+    # Create scheduler on first epoch with calculated total steps
+    if scheduler is None:
+        # Calculate total steps: 6,442,450,944 bytes ÷ 2 bytes/token ÷ 1024 tokens/seq ÷ 4 batch_size = 786,432 batches/epoch
+        batches_per_epoch = 786432
+        total_steps = args.num_epochs * batches_per_epoch
+        def get_lr(step):
+            if step < warmup_steps:
+                return 3e-4 * step / warmup_steps
+            else:
+                progress = (step - warmup_steps) / (total_steps - warmup_steps)
+                return 3e-5 + (3e-4 - 3e-5) * 0.5 * (1 + math.cos(math.pi * progress))
+        
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, get_lr)
+    
     # train and validate
     train_loss = train_epoch(epoch)
     validation_loss = validate_epoch(epoch)

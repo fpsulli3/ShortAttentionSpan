@@ -4,8 +4,14 @@ import torch.nn.functional as F
 import math
 
 class SelfAttention(nn.Module):
-    def __init__(self, embed_dim, dropout_prob):
+    def __init__(self, embed_dim, dropout_prob, n_heads):
         super().__init__()
+        self.embed_dim = embed_dim
+        self.n_heads = n_heads
+        self.head_dim = embed_dim // n_heads
+        
+        assert embed_dim % n_heads == 0, f"embed_dim ({embed_dim}) must be divisible by n_heads ({n_heads})"
+        
         self.proj_qkv = nn.Linear(embed_dim, 3 * embed_dim)
         self.proj_out = nn.Linear(embed_dim, embed_dim)
         self.attn_dropout = nn.Dropout(p=dropout_prob)
@@ -13,8 +19,8 @@ class SelfAttention(nn.Module):
 
     def forward(self, x):
         B, T, D = x.shape
-        Hdim = 64
-        H = int(D / Hdim)
+        H = self.n_heads
+        Hdim = self.head_dim
 
         qkv = self.proj_qkv(x)
         q, k, v = qkv.chunk(3, dim=-1)

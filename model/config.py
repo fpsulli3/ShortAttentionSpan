@@ -31,6 +31,7 @@ GPT_CONFIG_GPT2_SMALL = {
         "batch_size": 4,
         "emb_dim": 768,
         "n_layers": 12,
-        "drop_rate": 0.1,
+        "drop_rate": 0.05,
         "qkv_bias": True,
+        "n_heads": 12,  # 768 / 64 = 12 heads for 64-dim per head
     }
